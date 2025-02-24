@@ -4,17 +4,16 @@ import aiohttp
 import re
 import json
 
-
 class Filter:
     class Valves(BaseModel):
         enabled: bool = True
-
+        
     def __init__(self):
         self.valves = self.Valves()
         # Configure these settings for your Etherpad installation
         self.etherpad_url = "http://localhost:9001"  # Change to your Etherpad URL
         self.api_key = "1234567890"  # Your API key
-
+        
     async def fetch_pad_content(self, pad_name: str) -> Optional[Dict]:
         """Fetch pad content from Etherpad using the API"""
         try:
@@ -23,143 +22,134 @@ class Filter:
                 # Try the getText API endpoint
                 url = f"{self.etherpad_url}/api/1/getText"
                 params = {"apikey": self.api_key, "padID": pad_name}
-
+                
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         text = await response.text()
-
+                        
                         try:
                             data = json.loads(text)
-                            if (
-                                data.get("code") == 0
-                                and data.get("data")
-                                and data["data"].get("text")
-                            ):
+                            if data.get("code") == 0 and data.get("data") and data["data"].get("text"):
                                 pad_text = data["data"]["text"]
                                 lines = pad_text.split("\n")
-
+                                
                                 # Extract filename, context, and content based on your format
                                 # First line is filename, second line is context, rest is content
                                 if len(lines) >= 2:
                                     return {
                                         "filename": lines[0] if lines else "",
                                         "context": lines[1] if len(lines) > 1 else "",
-                                        "content": (
-                                            "\n".join(lines[2:])
-                                            if len(lines) > 2
-                                            else ""
-                                        ),
+                                        "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
                                     }
                                 else:
                                     # Return whatever we have if there aren't enough lines
                                     return {
                                         "filename": lines[0] if lines else "",
                                         "context": "",
-                                        "content": (
-                                            "\n".join(lines[1:])
-                                            if len(lines) > 1
-                                            else ""
-                                        ),
+                                        "content": "\n".join(lines[1:]) if len(lines) > 1 else "",
                                     }
                         except json.JSONDecodeError:
                             pass
-
+                
                 # If the API approach fails, try the direct URL
                 direct_url = f"{self.etherpad_url}/p/{pad_name}/export/txt"
                 async with session.get(direct_url) as response:
                     if response.status == 200:
                         text = await response.text()
                         lines = text.split("\n")
-
+                        
                         return {
                             "filename": lines[0] if lines else "",
                             "context": lines[1] if len(lines) > 1 else "",
                             "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
                         }
-
+                
                 # If all else fails, try scraping the HTML directly
                 fallback_url = f"{self.etherpad_url}/p/{pad_name}"
                 async with session.get(fallback_url) as response:
                     if response.status == 200:
                         html = await response.text()
-
+                        
                         # Try to extract pad content from HTML
-                        content_match = re.search(
-                            r'<div id="innerdocbody">(.*?)</div>', html, re.DOTALL
-                        )
+                        content_match = re.search(r'<div id="innerdocbody">(.*?)</div>', html, re.DOTALL)
                         if content_match:
                             content = content_match.group(1)
                             # Remove HTML tags
-                            content = re.sub(r"<[^>]+>", "", content)
+                            content = re.sub(r'<[^>]+>', '', content)
                             lines = content.split("\n")
-
+                            
                             return {
                                 "filename": lines[0] if lines else "",
                                 "context": lines[1] if len(lines) > 1 else "",
-                                "content": (
-                                    "\n".join(lines[2:]) if len(lines) > 2 else ""
-                                ),
+                                "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
                             }
-
+        
         except Exception as e:
             return None
-
+            
         return None
-
+            
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming messages from Open WebUI"""
         try:
             # Check if filter is enabled
             if not self.valves.enabled:
                 return body
-
+                
             # Check if message exists
             if not body.get("messages"):
                 return body
-
+                
             # Get the last message (the user's input)
             last_message = body["messages"][-1]
             if last_message["role"] != "user":
                 return body
-
+                
             # Get the prompt text
             prompt = last_message["content"]
-
-            # Look for {padname} pattern at the beginning of the message
-            # Format: {padname1,padname2} Remaining text...
-            match = re.match(r"^\{([^}]+)\}(.*)$", prompt.strip())
-            if not match:
+            
+            # Find all pad references in the message using {padname} pattern
+            # This will match multiple instances of {padname}
+            pad_references = re.findall(r'\{([^}]+)\}', prompt)
+            
+            if not pad_references:
                 return body
-
-            # Get pad names and remaining prompt
-            pad_names = [name.strip() for name in match.group(1).split(",")]
-            remaining_prompt = match.group(2).strip()
-
-            # Fetch content for each pad
-            formatted_contents = []
-            for pad_name in pad_names:
-                pad_data = await self.fetch_pad_content(pad_name)
-                if pad_data:
-                    # Make sure we properly format with matching opening and closing tags
-                    filename = pad_data["filename"]
-                    formatted = f"{pad_data['context']} [{filename}] {pad_data['content']} [/{filename}]"
-                    formatted_contents.append(formatted)
-                else:
-                    # If we couldn't fetch the pad, add a note about it
-                    formatted_contents.append(
-                        f"[Could not fetch content from pad '{pad_name}']"
-                    )
-
-            # If we have content, combine it with the remaining prompt
-            if formatted_contents:
-                new_prompt = "\n".join(formatted_contents) + "\n" + remaining_prompt
-                body["messages"][-1]["content"] = new_prompt
-
+                
+            # Store the processed prompt with replacements
+            processed_prompt = prompt
+            
+            # Process each pad reference
+            for pad_ref in pad_references:
+                # Get individual pad names if comma-separated
+                pad_names = [name.strip() for name in pad_ref.split(",")]
+                
+                # Build replacement text for this reference
+                replacement_parts = []
+                
+                for pad_name in pad_names:
+                    pad_data = await self.fetch_pad_content(pad_name)
+                    if pad_data:
+                        # Make sure we properly format with matching opening and closing tags
+                        filename = pad_data['filename']
+                        formatted = f"{pad_data['context']} [{filename}] {pad_data['content']} [/{filename}]"
+                        replacement_parts.append(formatted)
+                    else:
+                        # If we couldn't fetch the pad, add a note about it
+                        replacement_parts.append(f"[Could not fetch content from pad '{pad_name}']")
+                
+                # Replace the {padname} with the actual content
+                if replacement_parts:
+                    replacement_text = "\n".join(replacement_parts)
+                    processed_prompt = processed_prompt.replace(f"{{{pad_ref}}}", replacement_text)
+                
+            # Update the message with the processed prompt
+            body["messages"][-1]["content"] = processed_prompt
+            
             return body
         except Exception as e:
             # Return the original body to avoid breaking the application
             return body
-
+            
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process outgoing messages"""
         # This is just a passthrough for now
