@@ -3,154 +3,451 @@ from typing import Optional, Dict, List
 import aiohttp
 import re
 import json
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
 
 class Filter:
     class Valves(BaseModel):
         enabled: bool = True
-        
+
     def __init__(self):
         self.valves = self.Valves()
         # Configure these settings for your Etherpad installation
         self.etherpad_url = "http://localhost:9001"  # Change to your Etherpad URL
-        self.api_key = "1234567890"  # Your API key
-        
+        self.api_key = "frosted_butts"  # Your API key
+        # Ollama API settings
+        self.ollama_url = "http://localhost:11434"  # Change if your Ollama instance is elsewhere
+        self.embedding_model = "granite-embedding:30m"  # The working embedding model you confirmed
+        # Store pad content cache to avoid repeated fetches
+        self.pad_cache = {}
+
     async def fetch_pad_content(self, pad_name: str) -> Optional[Dict]:
         """Fetch pad content from Etherpad using the API"""
+        # Check cache first
+        if pad_name in self.pad_cache:
+            return self.pad_cache[pad_name]
+            
         try:
             # Use the official API approach first
             async with aiohttp.ClientSession() as session:
                 # Try the getText API endpoint
                 url = f"{self.etherpad_url}/api/1/getText"
                 params = {"apikey": self.api_key, "padID": pad_name}
-                
+
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         text = await response.text()
-                        
+
                         try:
                             data = json.loads(text)
-                            if data.get("code") == 0 and data.get("data") and data["data"].get("text"):
+                            if (
+                                data.get("code") == 0
+                                and data.get("data")
+                                and data["data"].get("text")
+                            ):
                                 pad_text = data["data"]["text"]
                                 lines = pad_text.split("\n")
-                                
+
                                 # Extract filename, context, and content based on your format
                                 # First line is filename, second line is context, rest is content
                                 if len(lines) >= 2:
-                                    return {
+                                    result = {
                                         "filename": lines[0] if lines else "",
                                         "context": lines[1] if len(lines) > 1 else "",
-                                        "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
+                                        "content": (
+                                            "\n".join(lines[2:])
+                                            if len(lines) > 2
+                                            else ""
+                                        ),
                                     }
+                                    self.pad_cache[pad_name] = result
+                                    return result
                                 else:
                                     # Return whatever we have if there aren't enough lines
-                                    return {
+                                    result = {
                                         "filename": lines[0] if lines else "",
                                         "context": "",
-                                        "content": "\n".join(lines[1:]) if len(lines) > 1 else "",
+                                        "content": (
+                                            "\n".join(lines[1:])
+                                            if len(lines) > 1
+                                            else ""
+                                        ),
                                     }
+                                    self.pad_cache[pad_name] = result
+                                    return result
                         except json.JSONDecodeError:
                             pass
-                
+
                 # If the API approach fails, try the direct URL
                 direct_url = f"{self.etherpad_url}/p/{pad_name}/export/txt"
                 async with session.get(direct_url) as response:
                     if response.status == 200:
                         text = await response.text()
                         lines = text.split("\n")
-                        
-                        return {
+
+                        result = {
                             "filename": lines[0] if lines else "",
                             "context": lines[1] if len(lines) > 1 else "",
                             "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
                         }
-                
+                        self.pad_cache[pad_name] = result
+                        return result
+
                 # If all else fails, try scraping the HTML directly
                 fallback_url = f"{self.etherpad_url}/p/{pad_name}"
                 async with session.get(fallback_url) as response:
                     if response.status == 200:
                         html = await response.text()
-                        
+
                         # Try to extract pad content from HTML
-                        content_match = re.search(r'<div id="innerdocbody">(.*?)</div>', html, re.DOTALL)
+                        content_match = re.search(
+                            r'<div id="innerdocbody">(.*?)</div>', html, re.DOTALL
+                        )
                         if content_match:
                             content = content_match.group(1)
                             # Remove HTML tags
-                            content = re.sub(r'<[^>]+>', '', content)
+                            content = re.sub(r"<[^>]+>", "", content)
                             lines = content.split("\n")
-                            
-                            return {
+
+                            result = {
                                 "filename": lines[0] if lines else "",
                                 "context": lines[1] if len(lines) > 1 else "",
-                                "content": "\n".join(lines[2:]) if len(lines) > 2 else "",
+                                "content": (
+                                    "\n".join(lines[2:]) if len(lines) > 2 else ""
+                                ),
                             }
-        
+                            self.pad_cache[pad_name] = result
+                            return result
+
         except Exception as e:
             return None
-            
+
         return None
+    
+    async def get_embeddings(self, chunks: List[str]) -> List[List[float]]:
+        """Get embeddings from Ollama API for a list of text chunks"""
+        embeddings = []
+        
+        async with aiohttp.ClientSession() as session:
+            for chunk in chunks:
+                if not chunk.strip():
+                    continue  # Skip empty chunks
+                    
+                payload = {
+                    "model": self.embedding_model,
+                    "prompt": chunk,
+                }
+                
+                try:
+                    # Call the Ollama embeddings endpoint
+                    async with session.post(
+                        f"{self.ollama_url}/api/embeddings", 
+                        json=payload,
+                        timeout=30
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            embedding = result.get("embedding", [])
+                            if embedding:
+                                embeddings.append(embedding)
+                except Exception:
+                    pass
             
+        return embeddings
+    
+    def chunk_text(self, text: str, chunk_level: int) -> List[str]:
+        """Split text into chunks, with chunk size dependent on chunk level (0-10)"""
+        # If no chunking requested, return the whole text as a single chunk
+        if chunk_level <= 0:
+            return [text]
+            
+        # Level 1: Phrase-level chunking (split by commas, colons, semicolons)
+        if chunk_level == 1:
+            # Split by commas, colons, semicolons that are followed by a space
+            # First split by newlines to maintain paragraph structure
+            paragraphs = text.split('\n')
+            
+            # Then split each paragraph by phrases
+            chunks = []
+            for paragraph in paragraphs:
+                if not paragraph.strip():
+                    continue
+                    
+                # Split paragraph into phrases
+                paragraph_phrases = re.split(r'(?<=[,;:])\s+', paragraph)
+                # Only add non-empty phrases
+                for phrase in paragraph_phrases:
+                    if phrase.strip():
+                        chunks.append(phrase.strip())
+            
+            return chunks
+            
+        # Level 2: Sentence-level chunking (split by periods, exclamation, question marks)
+        if chunk_level == 2:
+            # Improved sentence splitting that preserves document structure
+            # First split by paragraphs
+            paragraphs = text.split('\n')
+            
+            chunks = []
+            for paragraph in paragraphs:
+                if not paragraph.strip():
+                    continue
+                
+                # Split paragraph into sentences
+                sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+                # Only add non-empty sentences
+                for sentence in sentences:
+                    if sentence.strip():
+                        chunks.append(sentence.strip())
+            
+            return chunks
+            
+        # Level 3: Paragraph-level chunking
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+        
+        if chunk_level == 3:
+            return paragraphs
+            
+        # Level 4-10: Multi-paragraph chunking (4=2 paragraphs, 5=3 paragraphs, etc.)
+        chunks = []
+        # Calculate how many paragraphs per chunk (chunk_level 4 = 2 paragraphs, 5 = 3 paragraphs, etc.)
+        paragraphs_per_chunk = chunk_level - 2
+        
+        for i in range(0, len(paragraphs), paragraphs_per_chunk):
+            chunk = "\n".join(paragraphs[i:i+paragraphs_per_chunk])
+            chunks.append(chunk)
+        
+        return chunks
+    
+    def compress_by_importance(self, embeddings: List[List[float]], chunks: List[str], 
+                          compression_level: int) -> List[str]:
+        """
+        Compress content by selecting chunks most representative of the overall document.
+        This approach compares each chunk to the document as a whole.
+        """
+        if not embeddings or len(embeddings) <= 1:
+            return chunks
+        
+        # If we have more chunks than embeddings, trim the chunks to match
+        if len(chunks) > len(embeddings):
+            chunks = chunks[:len(embeddings)]
+        
+        # Define compression ratios - how much of the original to keep
+        compress_ratios = {
+            1: 0.9,   # 90% - minimal compression
+            2: 0.8,   # 80%
+            3: 0.7,   # 70%
+            4: 0.6,   # 60%
+            5: 0.5,   # 50% - moderate compression
+            6: 0.4,   # 40%
+            7: 0.3,   # 30%
+            8: 0.2,   # 20%
+            9: 0.15,  # 15%
+            10: 0.1   # 10% - maximum compression
+        }
+        
+        # Get compression ratio (defaulting to 0.5 if level not in map)
+        ratio = compress_ratios.get(compression_level, 0.5)
+        
+        # Calculate how many chunks to keep
+        n_chunks = len(chunks)
+        n_keep = max(1, min(n_chunks - 1, int(n_chunks * ratio)))
+        
+        # Ensure we're compressing at least a little
+        if n_keep >= n_chunks:
+            n_keep = max(1, n_chunks - 1)
+            
+        try:
+            # Convert embeddings to numpy array
+            embeddings_array = np.array(embeddings)
+            
+            # Calculate document centroid - the "average" meaning of the document
+            document_centroid = np.mean(embeddings_array, axis=0)
+            
+            # Calculate importance score for each chunk (similarity to document centroid)
+            importance_scores = []
+            for i, embedding in enumerate(embeddings_array):
+                # Fix any NaN or Inf values that would break similarity calculation
+                if np.isnan(embedding).any() or np.isinf(embedding).any():
+                    embedding = np.nan_to_num(embedding, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # Calculate cosine similarity to document centroid
+                similarity = cosine_similarity([embedding], [document_centroid])[0][0]
+                importance_scores.append((i, similarity))
+            
+            # Sort chunks by importance (most important first)
+            importance_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            # Select the top n_keep most important chunks
+            selected_indices = [x[0] for x in importance_scores[:n_keep]]
+            
+            # Sort indices to maintain original document order
+            selected_indices.sort()
+            
+            # Return the most important chunks in original order
+            return [chunks[i] for i in selected_indices]
+            
+        except Exception:
+            # If we encountered an error, return original chunks
+            return chunks
+    
+    async def compress_content(self, content: str, chunk_level: int, compression_level: int) -> str:
+        """Apply semantic compression to content based on chunk level and compression level"""
+        # Add a visible marker to verify compression is happening
+        marker = f"[DEBUG-COMPRESS:{chunk_level},{compression_level}] "
+        
+        # Quick returns for no chunking or compression
+        if chunk_level <= 0 and compression_level <= 0:
+            return marker + "[NO_COMPRESSION_REQUESTED] " + content
+            
+        # Skip compression for very short content
+        if len(content) < 100:
+            return marker + "[CONTENT_TOO_SHORT] " + content
+            
+        # Split content into chunks based on chunk_level
+        chunks = self.chunk_text(content, chunk_level)
+        
+        # Update marker with chunk count
+        marker += f"[CHUNKS:{len(chunks)}] "
+        
+        # Skip compression if not requested or only one chunk
+        if compression_level <= 0:
+            return marker + "[NO_COMPRESSION_LEVEL] " + content
+        
+        if len(chunks) <= 1:
+            return marker + "[ONLY_ONE_CHUNK] " + content
+        
+        # Get embeddings for chunks
+        embeddings = await self.get_embeddings(chunks)
+        
+        # FIX: Make sure we're using the right debug marker
+        marker += f"[EMBEDDINGS:{len(embeddings)}] "
+        
+        # Skip compression if not enough embeddings
+        if not embeddings or len(embeddings) < 2:
+            if not embeddings:
+                return marker + "[NO_EMBEDDINGS] " + content
+            else:
+                return marker + "[INSUFFICIENT_EMBEDDINGS] " + content
+        
+        # Compress content using IMPORTANCE-BASED approach
+        compressed_chunks = self.compress_by_importance(embeddings, chunks[:len(embeddings)], compression_level)
+        
+        # Update marker with compressed chunk count
+        marker += f"[COMPRESSED_CHUNKS:{len(compressed_chunks)}] "
+        
+        # Join compressed chunks back into text with proper formatting
+        if chunk_level == 1:  # Phrase level
+            # Join with spaces, not commas
+            compressed_content = " ".join(compressed_chunks)
+        elif chunk_level == 2:  # Sentence level
+            # Join with spaces and periods if needed
+            processed_sentences = []
+            for sentence in compressed_chunks:
+                # Make sure sentence ends with period if it doesn't have ending punctuation
+                if not sentence.endswith(('.', '!', '?', ':', ';')):
+                    sentence += '.'
+                processed_sentences.append(sentence)
+            
+            compressed_content = " ".join(processed_sentences)
+        else:  # Paragraph levels
+            # Join with newlines
+            compressed_content = "\n".join(compressed_chunks)
+        
+        # Verify we actually compressed the content
+        original_size = len(content)
+        compressed_size = len(compressed_content)
+        compression_ratio = compressed_size / original_size
+        
+        # Update marker with compression ratio
+        marker += f"[RATIO:{compression_ratio:.2f}] "
+        
+        # If compression was successful and meaningful, return compressed content
+        if len(compressed_chunks) < len(chunks):
+            return marker + "[SUCCESS] " + compressed_content
+        else:
+            return marker + "[INEFFECTIVE] " + content
+
+    async def process_message_content(self, prompt: str) -> str:
+        """Process a single message to replace pad references with content"""
+        # Find all pad references in the message using {padname} or {padname,chunk,compress} pattern
+        # This regex matches {name}, {name,number}, or {name,number,number}
+        pad_matches = re.findall(r"\{([^,}]+)(?:,(\d+))?(?:,(\d+))?\}", prompt)
+
+        if not pad_matches:
+            return prompt
+
+        processed_prompt = prompt
+
+        # Process each pad reference
+        for pad_match in pad_matches:
+            pad_ref = pad_match[0]
+            chunk_level = int(pad_match[1]) if len(pad_match) > 1 and pad_match[1] else 0
+            compression_level = int(pad_match[2]) if len(pad_match) > 2 and pad_match[2] else 0
+            
+            # Get individual pad names if comma-separated within the main reference
+            pad_names = [name.strip() for name in pad_ref.split(",")]
+
+            # Build replacement text for this reference
+            replacement_parts = []
+
+            for pad_name in pad_names:
+                pad_data = await self.fetch_pad_content(pad_name)
+                if pad_data:
+                    # Apply chunking and compression if requested
+                    content = pad_data["content"]
+                    
+                    if chunk_level > 0 or compression_level > 0:
+                        content = await self.compress_content(content, chunk_level, compression_level)
+                        
+                    # Make sure we properly format with matching opening and closing tags
+                    filename = pad_data["filename"]
+                    formatted = f"{pad_data['context']} [{filename}] {content} [/{filename}]"
+                    replacement_parts.append(formatted)
+                else:
+                    # If we couldn't fetch the pad, add a note about it
+                    replacement_parts.append(
+                        f"[Could not fetch content from pad '{pad_name}']"
+                    )
+
+            # Replace the pad reference with the actual content
+            if replacement_parts:
+                replacement_text = "\n".join(replacement_parts)
+                
+                # Create the pattern based on how many parameters were provided
+                if chunk_level > 0 and compression_level > 0:
+                    pattern = f"{{{pad_ref},{chunk_level},{compression_level}}}"
+                elif chunk_level > 0:
+                    pattern = f"{{{pad_ref},{chunk_level}}}"
+                else:
+                    pattern = f"{{{pad_ref}}}"
+                
+                processed_prompt = processed_prompt.replace(pattern, replacement_text)
+
+        return processed_prompt
+
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process incoming messages from Open WebUI"""
         try:
             # Check if filter is enabled
             if not self.valves.enabled:
                 return body
-                
+
             # Check if message exists
             if not body.get("messages"):
                 return body
-                
-            # Get the last message (the user's input)
-            last_message = body["messages"][-1]
-            if last_message["role"] != "user":
-                return body
-                
-            # Get the prompt text
-            prompt = last_message["content"]
-            
-            # Find all pad references in the message using {padname} pattern
-            # This will match multiple instances of {padname}
-            pad_references = re.findall(r'\{([^}]+)\}', prompt)
-            
-            if not pad_references:
-                return body
-                
-            # Store the processed prompt with replacements
-            processed_prompt = prompt
-            
-            # Process each pad reference
-            for pad_ref in pad_references:
-                # Get individual pad names if comma-separated
-                pad_names = [name.strip() for name in pad_ref.split(",")]
-                
-                # Build replacement text for this reference
-                replacement_parts = []
-                
-                for pad_name in pad_names:
-                    pad_data = await self.fetch_pad_content(pad_name)
-                    if pad_data:
-                        # Make sure we properly format with matching opening and closing tags
-                        filename = pad_data['filename']
-                        formatted = f"{pad_data['context']} [{filename}] {pad_data['content']} [/{filename}]"
-                        replacement_parts.append(formatted)
-                    else:
-                        # If we couldn't fetch the pad, add a note about it
-                        replacement_parts.append(f"[Could not fetch content from pad '{pad_name}']")
-                
-                # Replace the {padname} with the actual content
-                if replacement_parts:
-                    replacement_text = "\n".join(replacement_parts)
-                    processed_prompt = processed_prompt.replace(f"{{{pad_ref}}}", replacement_text)
-                
-            # Update the message with the processed prompt
-            body["messages"][-1]["content"] = processed_prompt
-            
+
+            # Process ALL messages in history, not just the latest one
+            for message in body["messages"]:
+                if message["role"] == "user" and "{" in message["content"] and "}" in message["content"]:
+                    message["content"] = await self.process_message_content(message["content"])
+
             return body
-        except Exception as e:
+        except Exception:
             # Return the original body to avoid breaking the application
             return body
-            
+
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
         """Process outgoing messages"""
-        # This is just a passthrough for now
         return body
