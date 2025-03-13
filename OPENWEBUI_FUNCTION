@@ -156,6 +156,34 @@ class Filter:
             
         return embeddings
     
+    async def get_single_embedding(self, text: str) -> Optional[List[float]]:
+        """Get embedding for a single text string"""
+        if not text or not text.strip():
+            return None
+            
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": self.embedding_model,
+                "prompt": text,
+            }
+            
+            try:
+                # Call the Ollama embeddings endpoint
+                async with session.post(
+                    f"{self.ollama_url}/api/embeddings", 
+                    json=payload,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        embedding = result.get("embedding", [])
+                        if embedding:
+                            return embedding
+            except Exception:
+                pass
+                
+        return None
+    
     def chunk_text(self, text: str, chunk_level: int) -> List[str]:
         """Split text into chunks, with chunk size dependent on chunk level (0-10)"""
         # If no chunking requested, return the whole text as a single chunk
@@ -221,10 +249,18 @@ class Filter:
         return chunks
     
     def compress_by_importance(self, embeddings: List[List[float]], chunks: List[str], 
-                          compression_level: int) -> List[str]:
+                         compression_level: int, description_embedding=None, 
+                         description_weight: float = 0.0) -> List[str]:
         """
-        Compress content by selecting chunks most representative of the overall document.
-        This approach compares each chunk to the document as a whole.
+        Compress content by selecting chunks most representative of the document.
+        Uses a weighted combination of similarity to document centroid and description.
+        
+        Args:
+            embeddings: List of embeddings for each chunk
+            chunks: List of text chunks
+            compression_level: Level of compression (1-10)
+            description_embedding: Optional embedding of the description
+            description_weight: Weight to give description similarity (0.0-1.0)
         """
         if not embeddings or len(embeddings) <= 1:
             return chunks
@@ -265,16 +301,33 @@ class Filter:
             # Calculate document centroid - the "average" meaning of the document
             document_centroid = np.mean(embeddings_array, axis=0)
             
-            # Calculate importance score for each chunk (similarity to document centroid)
+            # Calculate importance score for each chunk
             importance_scores = []
             for i, embedding in enumerate(embeddings_array):
-                # Fix any NaN or Inf values that would break similarity calculation
+                # Fix any NaN or Inf values
                 if np.isnan(embedding).any() or np.isinf(embedding).any():
                     embedding = np.nan_to_num(embedding, nan=0.0, posinf=1.0, neginf=-1.0)
                 
-                # Calculate cosine similarity to document centroid
-                similarity = cosine_similarity([embedding], [document_centroid])[0][0]
-                importance_scores.append((i, similarity))
+                # Calculate similarity to document centroid
+                doc_similarity = cosine_similarity([embedding], [document_centroid])[0][0]
+                
+                # Initialize final score with document similarity
+                final_score = doc_similarity
+                
+                # If we have a description embedding and weight, factor it in
+                if description_embedding is not None and description_weight > 0:
+                    # Fix any NaN or Inf values in description embedding
+                    if np.isnan(description_embedding).any() or np.isinf(description_embedding).any():
+                        description_embedding = np.nan_to_num(description_embedding, nan=0.0, posinf=1.0, neginf=-1.0)
+                    
+                    # Calculate similarity to description
+                    desc_similarity = cosine_similarity([embedding], [description_embedding])[0][0]
+                    
+                    # Weight the scores
+                    doc_weight = 1.0 - description_weight
+                    final_score = (doc_similarity * doc_weight) + (desc_similarity * description_weight)
+                
+                importance_scores.append((i, final_score))
             
             # Sort chunks by importance (most important first)
             importance_scores.sort(key=lambda x: x[1], reverse=True)
@@ -292,10 +345,13 @@ class Filter:
             # If we encountered an error, return original chunks
             return chunks
     
-    async def compress_content(self, content: str, chunk_level: int, compression_level: int) -> str:
+    async def compress_content(self, content: str, chunk_level: int, compression_level: int, 
+                       description: str = "", description_weight: float = 0) -> str:
         """Apply semantic compression to content based on chunk level and compression level"""
         # Add a visible marker to verify compression is happening
-        marker = f"[DEBUG-COMPRESS:{chunk_level},{compression_level}] "
+        # Include description weight in the marker if it's being used
+        weight_marker = f",DW:{description_weight:.1f}" if description_weight > 0 else ""
+        marker = f"[DEBUG-COMPRESS:{chunk_level},{compression_level}{weight_marker}] "
         
         # Quick returns for no chunking or compression
         if chunk_level <= 0 and compression_level <= 0:
@@ -321,7 +377,7 @@ class Filter:
         # Get embeddings for chunks
         embeddings = await self.get_embeddings(chunks)
         
-        # FIX: Make sure we're using the right debug marker
+        # Ensure we're using the right debug marker
         marker += f"[EMBEDDINGS:{len(embeddings)}] "
         
         # Skip compression if not enough embeddings
@@ -331,8 +387,24 @@ class Filter:
             else:
                 return marker + "[INSUFFICIENT_EMBEDDINGS] " + content
         
-        # Compress content using IMPORTANCE-BASED approach
-        compressed_chunks = self.compress_by_importance(embeddings, chunks[:len(embeddings)], compression_level)
+        # Get description embedding if needed
+        description_embedding = None
+        if description and description_weight > 0:
+            description_embedding = await self.get_single_embedding(description)
+            
+            # If we couldn't get a description embedding, log it and proceed without it
+            if not description_embedding:
+                marker += "[DESC_EMBEDDING_FAILED] "
+                description_weight = 0
+        
+        # Compress content using weighted importance approach
+        compressed_chunks = self.compress_by_importance(
+            embeddings, 
+            chunks[:len(embeddings)], 
+            compression_level,
+            description_embedding,
+            description_weight
+        )
         
         # Update marker with compressed chunk count
         marker += f"[COMPRESSED_CHUNKS:{len(compressed_chunks)}] "
@@ -371,9 +443,9 @@ class Filter:
 
     async def process_message_content(self, prompt: str) -> str:
         """Process a single message to replace pad references with content"""
-        # Find all pad references in the message using {padname} or {padname,chunk,compress} pattern
-        # This regex matches {name}, {name,number}, or {name,number,number}
-        pad_matches = re.findall(r"\{([^,}]+)(?:,(\d+))?(?:,(\d+))?\}", prompt)
+        # Updated regex to match {name}, {name,number}, or {name,number,number,number}
+        # The fourth parameter is the optional description weight
+        pad_matches = re.findall(r"\{([^,}]+)(?:,(\d+))?(?:,(\d+))?(?:,(\d+))?\}", prompt)
 
         if not pad_matches:
             return prompt
@@ -385,6 +457,7 @@ class Filter:
             pad_ref = pad_match[0]
             chunk_level = int(pad_match[1]) if len(pad_match) > 1 and pad_match[1] else 0
             compression_level = int(pad_match[2]) if len(pad_match) > 2 and pad_match[2] else 0
+            description_weight = float(pad_match[3]) / 10 if len(pad_match) > 3 and pad_match[3] else 0
             
             # Get individual pad names if comma-separated within the main reference
             pad_names = [name.strip() for name in pad_ref.split(",")]
@@ -399,7 +472,15 @@ class Filter:
                     content = pad_data["content"]
                     
                     if chunk_level > 0 or compression_level > 0:
-                        content = await self.compress_content(content, chunk_level, compression_level)
+                        # Pass the description for weighted compression if requested
+                        description = pad_data["context"] if description_weight > 0 else ""
+                        content = await self.compress_content(
+                            content, 
+                            chunk_level, 
+                            compression_level,
+                            description,
+                            description_weight
+                        )
                         
                     # Make sure we properly format with matching opening and closing tags
                     filename = pad_data["filename"]
@@ -416,9 +497,11 @@ class Filter:
                 replacement_text = "\n".join(replacement_parts)
                 
                 # Create the pattern based on how many parameters were provided
-                if chunk_level > 0 and compression_level > 0:
+                if len(pad_match) > 3 and pad_match[3]:
+                    pattern = f"{{{pad_ref},{chunk_level},{compression_level},{pad_match[3]}}}"
+                elif len(pad_match) > 2 and pad_match[2]:
                     pattern = f"{{{pad_ref},{chunk_level},{compression_level}}}"
-                elif chunk_level > 0:
+                elif len(pad_match) > 1 and pad_match[1]:
                     pattern = f"{{{pad_ref},{chunk_level}}}"
                 else:
                     pattern = f"{{{pad_ref}}}"
